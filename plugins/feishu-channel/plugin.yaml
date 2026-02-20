@@ -1,0 +1,34 @@
+api_version: "1.0"
+name: "feishu-channel"
+version: "0.2.0"
+description: "Enhanced Feishu (Lark) channel integration with rich features (lark-oapi 1.5.3+)"
+author: "DavyBot Team (inspired by clawdbot-feishu)"
+license: "MIT"
+python_version: ">=3.12"
+
+type: "channel"
+entry_point: "plugin:FeishuChannelPlugin"
+
+dependencies:
+  pypi:
+    - "aiohttp>=3.9.0"
+    - "lark-oapi>=1.5.3"
+
+config_schema: "./config_schema.json"
+
+hooks:
+  - "after_tool_call"
+  - "on_task_complete"
+  - "on_error"
+
+settings:
+  enabled: true
+  priority: 50
+  auto_activate: false
+
+capabilities:
+  - "send_text"
+  - "send_card"
+  - "@mentions"
+  - "message_retry"
+  - "rich_templates"
