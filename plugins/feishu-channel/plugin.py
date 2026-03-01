@@ -46,7 +46,6 @@ from lark_oapi.api.im.v1 import (
 # Try multiple possible paths for shared module
 possible_shared_paths = [
     Path(__file__).parent,
-    Path(__file__).parent.parent / "shared",
 ]
 
 for shared_path in possible_shared_paths:
@@ -55,7 +54,7 @@ for shared_path in possible_shared_paths:
             sys.path.insert(0, str(shared_path))
     
 
-from plugin_base import ChannelPlugin, PluginConfig
+from dawei.plugins.base import ChannelPlugin, PluginConfig
 
 
 logger = logging.getLogger(__name__)
@@ -879,9 +878,9 @@ class FeishuChannelPlugin(ChannelPlugin):
             # Determine workspace path
             # Try to find workspace from plugin location
             plugin_dir = Path(__file__).parent.parent.parent
-            workspace_path = plugin_dir
+            workspace_dir = plugin_dir
 
-            logger.info(f"📂 使用工作区: {workspace_path}")
+            logger.info(f"📂 使用工作区目录: {workspace_dir}")
 
             # Import Agent
             try:
@@ -900,13 +899,19 @@ class FeishuChannelPlugin(ChannelPlugin):
                 from dawei.workspace.user_workspace import UserWorkspace
                 from dawei.entity.user_input_message import UserInputMessage
 
+            # ✅ 修复：创建 UserWorkspace 对象
+            logger.info("🏗️ 创建 UserWorkspace 对象...")
+            user_workspace = UserWorkspace(str(workspace_dir))
+            await user_workspace.initialize()
+            logger.info(f"✅ UserWorkspace 初始化完成: {user_workspace.workspace_path}")
+
             # Create UserInputMessage (same as WebSocket handler)
             user_input = UserInputMessage(text=text)
             logger.info(f"📝 创建UserInputMessage: {text[:50]}...")
 
             # Create and initialize Agent (same as _create_and_initialize_agent)
             logger.info("🤖 创建Agent实例...")
-            agent = await Agent.create_with_default_engine(workspace_path)
+            agent = await Agent.create_with_default_engine(user_workspace)
 
             logger.info("⚙️ 初始化Agent...")
             await agent.initialize()
@@ -917,19 +922,77 @@ class FeishuChannelPlugin(ChannelPlugin):
 
             logger.info(f"✅ Agent处理完成: {result}")
 
-            # Send acknowledgment to Feishu
-            # Note: Agent events will be forwarded automatically via event handlers
-            # For now, just send a simple acknowledgment
-            # The actual response will come from the agent's event system
+            # ✅ 修复：Agent 返回 None，需要从对话历史中获取最后的助手消息
+            try:
+                # 获取对话中最后一条助手消息
+                if hasattr(agent, 'user_workspace') and hasattr(agent.user_workspace, 'current_conversation'):
+                    conversation = agent.user_workspace.current_conversation
+
+                    if conversation and hasattr(conversation, 'messages'):
+                        # 获取最后一条消息（应该是助手的回复）
+                        last_message = conversation.messages[-1] if conversation.messages else None
+
+                        if last_message and hasattr(last_message, 'content'):
+                            response_text = last_message.content
+                            logger.info(f"📝 从对话历史获取响应: {response_text[:100] if response_text else '(empty)'}...")
+                        else:
+                            logger.warning("⚠️ 对话历史中无有效响应")
+                            response_text = None
+                    else:
+                        logger.warning("⚠️ 无对话历史或消息")
+                        response_text = None
+                else:
+                    logger.warning("⚠️ Agent 无对话或用户工作区")
+                    response_text = None
+
+            except Exception as extract_err:
+                logger.error(f"❌ 提取响应失败: {extract_err}", exc_info=True)
+                response_text = None
+
+            # Send response to Feishu
+            try:
+                if response_text:
+                    logger.info(f"📤 发送响应到飞书: {response_text[:100]}...")
+
+                    # ✅ 修复：使用配置的 receive_id 而不是事件中的 chat_id
+                    # 事件中的 chat_id 可能为空，应该使用配置的 receive_id
+                    target_receive_id = chat_id if chat_id else self.receive_id
+
+                    if not target_receive_id:
+                        logger.error("❌ 无法发送响应：receive_id 未配置且事件中无 chat_id")
+                    else:
+                        await self.send_message(
+                            response_text,
+                            receive_id=target_receive_id
+                        )
+                        logger.info("✅ 响应已发送到飞书")
+                else:
+                    logger.warning("⚠️ Agent 返回空响应，不发送消息")
+
+            except Exception as send_err:
+                logger.error(f"❌ 发送响应到飞书失败: {send_err}", exc_info=True)
+
+            # Cleanup agent
+            try:
+                await agent.cleanup()
+                logger.info("✅ Agent 已清理")
+            except Exception as cleanup_err:
+                logger.error(f"⚠️ Agent 清理失败: {cleanup_err}")
 
         except Exception as e:
             logger.error(f"❌ Agent处理消息失败: {e}", exc_info=True)
             # Send error message to Feishu
             try:
-                await self.send_message(
-                    f"❌ 处理失败: {str(e)[:100]}",
-                    receive_id=chat_id
-                )
+                # ✅ 修复：使用配置的 receive_id 而不是事件中的 chat_id
+                target_receive_id = chat_id if chat_id else self.receive_id
+
+                if target_receive_id:
+                    await self.send_message(
+                        f"❌ 处理失败: {str(e)[:100]}",
+                        receive_id=target_receive_id
+                    )
+                else:
+                    logger.error("❌ 无法发送错误消息：receive_id 未配置且事件中无 chat_id")
             except Exception as send_err:
                 logger.error(f"发送错误消息失败: {send_err}")
             # await self._forward_to_agent(chat_id, text, sender_open_id)
@@ -1058,6 +1121,95 @@ class FeishuLongConnectionHandler:
                     "create_time": message.create_time,
                     "update_time": message.update_time,
                 }
+
+                # ✅ 修复：解析 content 并提取 text 字段
+                # 飞书消息的 content 是 JSON 字符串，如 '{"text":"hello"}'
+                content_str = message.content or "{}"
+                text = ""
+
+                try:
+                    # 解析 JSON 字符串
+                    if isinstance(content_str, str):
+                        content = json.loads(content_str)
+                    else:
+                        content = content_str
+
+                    # 提取文本内容
+                    text = content.get("text", "")
+
+                    # 处理其他消息类型
+                    if not text:
+                        msg_type = message.message_type
+
+                        if msg_type == "post":
+                            # 富文本消息
+                            text = "[富文本消息]"
+                            post = content.get("post", {})
+                            if isinstance(post, dict):
+                                # 尝试提取富文本内容
+                                for lang in ["zh_cn", "en", "ja"]:
+                                    if lang in post:
+                                        post_content = post[lang]
+                                        if isinstance(post_content, list):
+                                            # 提取段落文本
+                                            texts = []
+                                            for elem in post_content:
+                                                if isinstance(elem, dict):
+                                                    tag = elem.get("tag", "")
+                                                    if tag == "text":
+                                                        texts.append(elem.get("text", ""))
+                                                    elif tag == "a":
+                                                        texts.append(elem.get("text", ""))
+                                            if texts:
+                                                text = "\n".join(texts)
+                                                break
+
+                        elif msg_type == "image":
+                            text = "[图片]"
+                            image_key = content.get("image_key")
+                            if image_key:
+                                text = f"[图片: {image_key}]"
+
+                        elif msg_type == "audio":
+                            text = "[音频]"
+                            audio_key = content.get("file_key")
+                            if audio_key:
+                                text = f"[音频: {audio_key}]"
+
+                        elif msg_type == "video":
+                            text = "[视频]"
+                            video_key = content.get("file_key")
+                            if video_key:
+                                text = f"[视频: {video_key}]"
+
+                        elif msg_type == "file":
+                            text = "[文件]"
+                            file_key = content.get("file_key")
+                            if file_key:
+                                text = f"[文件: {file_key}]"
+
+                        elif msg_type == "sticker":
+                            text = "[表情包]"
+
+                        elif not text:
+                            # 未知类型，使用原始 content
+                            text = str(content_str)[:100] if content_str else "[空消息]"
+
+                except json.JSONDecodeError as e:
+                    # JSON 解析失败，直接使用原始字符串
+                    logger.warning(f"Failed to parse content as JSON: {e}, using raw content")
+                    text = content_str if content_str else "[解析失败]"
+                except Exception as e:
+                    logger.error(f"Error parsing message content: {e}", exc_info=True)
+                    text = str(content_str)[:100] if content_str else "[解析错误]"
+
+                # 将解析后的 text 添加到 event_data
+                event_data["text"] = text
+                logger.info(f"📝 解析后的消息文本: {text}")
+
+            # 兼容：如果没有 message 对象，设置空的 text
+            if "text" not in event_data:
+                event_data["text"] = ""
 
             logger.info(f"📨 消息详情: {event_data}")
 
